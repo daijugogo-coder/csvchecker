@@ -1,2 +1,2 @@
-streamlitstreamlit==1.41.1
+streamlit==1.41.1
 
