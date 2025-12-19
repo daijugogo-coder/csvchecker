@@ -127,7 +127,7 @@ def analyze_dates_from_text(csv_text: str) -> DateAnalysis:
     day_set: Set[str] = set()
     total_matches = 0
 
-    reader = csv.reader(StringIO(csv_text))
+    reader = csv_reader_from_text(csv_text)
     for row_num, row in enumerate(reader, start=1):
         if row_num > MAX_ROWS:
             raise ValueError(f"行数が上限（{MAX_ROWS}行）を超えました。")
@@ -145,7 +145,7 @@ def check_csv_from_text(csv_text: str) -> Tuple[bool, List[ErrorDetail], int]:
     error_details: List[ErrorDetail] = []
     total_rows = 0
 
-    reader = csv.reader(StringIO(csv_text))
+    reader = csv_reader_from_text(csv_text)
     for row_num, row in enumerate(reader, start=1):
         if row_num > MAX_ROWS:
             raise ValueError(f"行数が上限（{MAX_ROWS}行）を超えました。")
