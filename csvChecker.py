@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Streamlit版 CSVファイルチェッカー（cp932対応・LF改行）＋ 日付項目の解析
+Streamlit版 CSVファイルチェッカー（cp932対応・LF改行）
 
-- 既存ルール: 25列が "Z00014" かつ 38列が "3000/5000" 以外ならNG
-- 拡張: yyyy/mm/dd hh:mi:ss 形式の列のみ抽出して、すべて同じ「日」か判定
+主チェック:
+  - 25列目 == "Z00014" かつ 38列目 が "3000/5000" 以外 → NG
 
-Web要件:
-  - CSVをドラッグ&ドロップで置いたら即検査（ボタン不要）
-  - 処理中は「確認中」モーダル風表示＋回転アイコン
-  - アップロードファイルはサーバ(ディスク)に残さない（メモリ上のみで処理）
-  - NG時はエラー詳細CSVをダウンロード提供（ディスクに書かない）
-  - 読み込めるファイルは最大 50,000 物理行まで（超えたらエラー）
-  - エラー行番号は「物理行（テキスト上の行）」で返す（セル内改行があっても、エディタ行番号と一致）
+日付チェック（業務仕様）:
+  - 9列目（必須）: yyyy/mm/dd hh:mm:ss が無い/不正 → エラー
+  - 16列目: 無視
+  - 17列目:
+      - 空/NULL → 警告（要確認）
+      - 日付形式でない → 警告（要確認）
+      - 日付形式なら 9列目と yyyy/mm/dd が一致するか確認
+          - 不一致 → 警告（要確認）
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, date
 from io import StringIO
-from typing import Iterable, List, Optional, Set, Tuple
+from typing import List, Optional, Tuple
 
 import streamlit as st
 
@@ -32,10 +33,15 @@ import streamlit as st
 # ----------------------------
 TARGET_COL_25 = 24
 TARGET_COL_38 = 37
+
+DATE_COL_9 = 8     # 9列目（必須）
+DATE_COL_16 = 15   # 16列目（無視）
+DATE_COL_17 = 16   # 17列目（確認対象）
+
 DATE_TIME_RE = re.compile(r"^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}$")
+MAX_PHYSICAL_LINES = 50_000  # UIには出さない（内部上限）
 
-MAX_PHYSICAL_LINES = 50_000  # 物理行（エディタで見える行）の上限
-
+# （豆知識は任意機能）
 SOLAR_TERMS_2025 = [
     (date(2025, 1, 5), "小寒"), (date(2025, 1, 20), "大寒"),
     (date(2025, 2, 3), "立春"), (date(2025, 2, 18), "雨水"),
@@ -50,7 +56,6 @@ SOLAR_TERMS_2025 = [
     (date(2025, 11, 7), "立冬"), (date(2025, 11, 22), "小雪"),
     (date(2025, 12, 7), "大雪"), (date(2025, 12, 22), "冬至"),
 ]
-
 ANNIVERSARIES = {
     (1, 1): ["元日"], (2, 14): ["バレンタインデー"], (3, 3): ["ひな祭り"],
     (4, 29): ["昭和の日"], (5, 5): ["こどもの日"], (7, 7): ["七夕"],
@@ -70,14 +75,28 @@ class ErrorDetail:
 
 
 @dataclass
-class DateAnalysis:
-    total_matches: int
-    unique_days: Set[str]
-    first_day_str: Optional[str]
+class DateIssue:
+    record_no: int
+    start_physical_line: int
+    severity: str   # "ERROR" or "WARN"
+    issue_type: str
+    col9: str
+    col17: str
+    note: str
+
+
+@dataclass
+class DateSummary:
+    total_checked_cells: int
+    count_col9_ok: int
+    count_col17_ok: int
+    count_warn: int
+    count_error: int
+    issues: List[DateIssue]
 
 
 # ----------------------------
-# Helper functions (logic)
+# Helper functions
 # ----------------------------
 def approximate_rokuyo(g_date: date) -> str:
     idx = (g_date.month + g_date.day) % 6
@@ -111,105 +130,176 @@ def friendly_today_info() -> str:
     )
 
 
-def parse_dates_from_row(row: Iterable[str]) -> List[datetime]:
-    dt_list: List[datetime] = []
-    for cell in row:
-        s = cell.strip()
-        if DATE_TIME_RE.match(s):
-            try:
-                dt_list.append(datetime.strptime(s, "%Y/%m/%d %H:%M:%S"))
-            except Exception:
-                # 形式に合っていても実際は不正、みたいなケースは無視
-                pass
-    return dt_list
-
-
 def csv_reader_from_text(csv_text: str) -> csv.reader:
-    # csv module 推奨: newline="" で改行の扱いをcsv側に任せる（セル内改行を含むCSVでも安定）
+    # セル内LFを含むCSVでも列ズレしない前提（重要）
     return csv.reader(StringIO(csv_text, newline=""))
 
 
-def analyze_dates_from_text(csv_text: str) -> DateAnalysis:
-    """
-    csv_text: すでに文字列（cp932デコード済み）
-    """
-    day_set: Set[str] = set()
-    total_matches = 0
-
-    reader = csv_reader_from_text(csv_text)
-    for row in reader:
-        dts = parse_dates_from_row(row)
-        for dt in dts:
-            total_matches += 1
-            day_set.add(dt.strftime("%Y/%m/%d"))
-
-        # 物理行数の上限（セル内改行ありでも、reader.line_num が物理行）
-        if reader.line_num > MAX_PHYSICAL_LINES:
-            raise ValueError(f"読み込み行数が上限を超えました（最大 {MAX_PHYSICAL_LINES} 行）。")
-
-    first_day_str = next(iter(day_set)) if day_set else None
-    return DateAnalysis(total_matches=total_matches, unique_days=day_set, first_day_str=first_day_str)
-
-
-def check_csv_from_text(csv_text: str) -> Tuple[bool, List[ErrorDetail], int, int]:
-    """
-    Returns:
-      error_found, error_details, total_records, total_physical_lines
-    """
-    error_details: List[ErrorDetail] = []
-    total_records = 0
-    total_physical_lines = 0
-
-    reader = csv_reader_from_text(csv_text)
-
-    # 物理行番号（テキストの行番号）をレコード単位で算出する
-    prev_end_line = 0  # 直前レコードが終了した物理行（1-based）
-
-    for record_num, row in enumerate(reader, start=1):
-        total_records = record_num
-
-        # このレコードの開始/終了の物理行番号
-        start_physical_line = prev_end_line + 1
-        end_physical_line = reader.line_num  # ここまで読んだ物理行数（1-based）
-        prev_end_line = end_physical_line
-        total_physical_lines = end_physical_line
-
-        # 物理行上限チェック
-        if total_physical_lines > MAX_PHYSICAL_LINES:
-            raise ValueError(f"読み込み行数が上限を超えました（最大 {MAX_PHYSICAL_LINES} 行）。")
-
-        # 38列目に届かない行はスキップ（元コード踏襲）
-        if len(row) < (TARGET_COL_38 + 1):
-            continue
-
-        col_3 = row[2].strip() if len(row) > 2 else ""
-        col_11 = row[10].strip() if len(row) > 10 else ""
-        col_25 = row[TARGET_COL_25].strip()
-        col_38 = row[TARGET_COL_38].strip()
-
-        if col_25 == "Z00014" and col_38 not in {"3000", "5000"}:
-            error_details.append(
-                ErrorDetail(
-                    row=start_physical_line,  # ★物理行（開始行）を返す
-                    store_name=col_3,
-                    slip_number=col_11,
-                    col_38=col_38,
-                )
-            )
-
-    return (len(error_details) > 0), error_details, total_records, total_physical_lines
+def parse_dt_str(s: str) -> Optional[datetime]:
+    t = s.strip()
+    if not DATE_TIME_RE.match(t):
+        return None
+    try:
+        return datetime.strptime(t, "%Y/%m/%d %H:%M:%S")
+    except Exception:
+        return None
 
 
 def build_error_csv_bytes(details: List[ErrorDetail]) -> bytes:
-    """
-    エラー詳細CSVをUTF-8でメモリ上に生成して返す（ディスクに書かない）
-    """
     buf = StringIO()
     w = csv.writer(buf, lineterminator="\n")
     w.writerow(["行番号(物理行)", "店舗名", "伝票番号", "金額(38列目)"])
     for d in details:
         w.writerow([d.row, d.store_name, d.slip_number, d.col_38])
     return buf.getvalue().encode("utf-8")
+
+
+def build_date_issue_csv_bytes(issues: List[DateIssue]) -> bytes:
+    buf = StringIO()
+    w = csv.writer(buf, lineterminator="\n")
+    w.writerow(["レコード番号", "開始物理行(参考)", "重要度", "種別", "9列目", "17列目", "補足"])
+    for it in issues:
+        w.writerow([it.record_no, it.start_physical_line, it.severity, it.issue_type, it.col9, it.col17, it.note])
+    return buf.getvalue().encode("utf-8")
+
+
+# ----------------------------
+# Core logic (1 pass)
+# ----------------------------
+def check_and_analyze(csv_text: str) -> Tuple[bool, List[ErrorDetail], int, int, DateSummary]:
+    error_details: List[ErrorDetail] = []
+    total_data_records = 0
+    total_physical_lines = 0
+
+    total_checked_cells = 0
+    count_col9_ok = 0
+    count_col17_ok = 0
+    count_warn = 0
+    count_error = 0
+    issues: List[DateIssue] = []
+
+    reader = csv_reader_from_text(csv_text)
+    prev_end_line = 0
+
+    for record_no, row in enumerate(reader, start=1):
+        # 物理行の管理（ヘッダーでも必ず更新する）
+        start_physical_line = prev_end_line + 1
+        end_physical_line = reader.line_num
+        prev_end_line = end_physical_line
+        total_physical_lines = end_physical_line
+
+        if total_physical_lines > MAX_PHYSICAL_LINES:
+            raise ValueError("ファイルが大きすぎるため処理できませんでした。（上限超過）")
+
+        # ★ 1行目はヘッダーなので完全に無視
+        if record_no == 1:
+            continue
+
+        # ここから下はデータ行のみ
+        total_data_records += 1
+        data_record_no = total_data_records  # ヘッダー除外の連番で表示したいならこれ
+
+        # ----------------------------
+        # NGチェック（25/38列）
+        # ----------------------------
+        if len(row) >= (TARGET_COL_38 + 1):
+            col_3 = row[2].strip() if len(row) > 2 else ""
+            col_11 = row[10].strip() if len(row) > 10 else ""
+            col_25 = row[TARGET_COL_25].strip()
+            col_38 = row[TARGET_COL_38].strip()
+
+            if col_25 == "Z00014" and col_38 not in {"3000", "5000"}:
+                error_details.append(
+                    ErrorDetail(
+                        row=start_physical_line,
+                        store_name=col_3,
+                        slip_number=col_11,
+                        col_38=col_38,
+                    )
+                )
+
+        # ----------------------------
+        # 日付チェック（9列目必須、17列目は警告基準）
+        # ----------------------------
+        col9 = row[DATE_COL_9].strip() if len(row) > DATE_COL_9 else ""
+        col17 = row[DATE_COL_17].strip() if len(row) > DATE_COL_17 else ""
+
+        dt9 = parse_dt_str(col9)
+        if dt9 is None:
+            count_error += 1
+            issues.append(
+                DateIssue(
+                    record_no=data_record_no,
+                    start_physical_line=start_physical_line,
+                    severity="ERROR",
+                    issue_type="COL9_MISSING_OR_INVALID",
+                    col9=col9,
+                    col17=col17,
+                    note="9列目に yyyy/mm/dd hh:mm:ss が必要です（業務上あり得ないデータ）。",
+                )
+            )
+        else:
+            count_col9_ok += 1
+            total_checked_cells += 1
+
+        dt17 = parse_dt_str(col17)
+        if not col17.strip():
+            count_warn += 1
+            issues.append(
+                DateIssue(
+                    record_no=data_record_no,
+                    start_physical_line=start_physical_line,
+                    severity="WARN",
+                    issue_type="COL17_EMPTY",
+                    col9=col9,
+                    col17=col17,
+                    note="17列目が空です（要確認）。NULLの場合もあり得るため人間確認が必要です。",
+                )
+            )
+        elif dt17 is None:
+            count_warn += 1
+            issues.append(
+                DateIssue(
+                    record_no=data_record_no,
+                    start_physical_line=start_physical_line,
+                    severity="WARN",
+                    issue_type="COL17_INVALID",
+                    col9=col9,
+                    col17=col17,
+                    note="17列目が日付形式ではありません（要確認）。",
+                )
+            )
+        else:
+            count_col17_ok += 1
+            total_checked_cells += 1
+            if dt9 is not None:
+                d9 = dt9.strftime("%Y/%m/%d")
+                d17 = dt17.strftime("%Y/%m/%d")
+                if d9 != d17:
+                    count_warn += 1
+                    issues.append(
+                        DateIssue(
+                            record_no=data_record_no,
+                            start_physical_line=start_physical_line,
+                            severity="WARN",
+                            issue_type="DATE_MISMATCH",
+                            col9=col9,
+                            col17=col17,
+                            note=f"9列目({d9}) と 17列目({d17}) の日付が一致しません（要確認）。",
+                        )
+                    )
+
+    date_summary = DateSummary(
+        total_checked_cells=total_checked_cells,
+        count_col9_ok=count_col9_ok,
+        count_col17_ok=count_col17_ok,
+        count_warn=count_warn,
+        count_error=count_error,
+        issues=issues,
+    )
+
+    # total_records は「データ行数（ヘッダー除外）」で返す
+    return (len(error_details) > 0), error_details, total_data_records, total_physical_lines, date_summary
 
 
 # ----------------------------
@@ -219,7 +309,6 @@ def inject_base_css() -> None:
     st.markdown(
         """
 <style>
-/* Simple full-screen overlay (modal-like) */
 #processing-overlay {
   position: fixed;
   z-index: 99999;
@@ -229,7 +318,6 @@ def inject_base_css() -> None:
   align-items: center;
   justify-content: center;
 }
-
 .processing-card {
   background: white;
   padding: 18px 22px;
@@ -240,7 +328,6 @@ def inject_base_css() -> None:
   align-items: center;
   min-width: 260px;
 }
-
 .spinner {
   width: 22px;
   height: 22px;
@@ -249,20 +336,9 @@ def inject_base_css() -> None:
   border-radius: 50%;
   animation: spin 0.9s linear infinite;
 }
-
-@keyframes spin {
-  to { transform: rotate(360deg); }
-}
-
-.processing-text {
-  font-size: 16px;
-  font-weight: 600;
-}
-.small-note {
-  font-size: 12px;
-  color: #666;
-  margin-top: 2px;
-}
+@keyframes spin { to { transform: rotate(360deg); } }
+.processing-text { font-size: 16px; font-weight: 600; }
+.small-note { font-size: 12px; color: #666; margin-top: 2px; }
 </style>
         """,
         unsafe_allow_html=True,
@@ -299,13 +375,12 @@ def main() -> None:
 
     st.title("CSVチェッカー")
 
-    # 要件：静的な箇条書き（＋ 5万行制限）
     st.markdown(
-        f"""
-- CSVファイルをドラッグドロップで置いてください
-- 通信は暗号化しているので盗聴されません
-- 処理ファイルはサーバに残さないので安全です
-- 読み込めるファイルは最大 **{MAX_PHYSICAL_LINES:,}行（物理行）** までです
+        """
+- CSVファイルをドラッグ&ドロップで置いてください（置いたら自動でチェックします）
+- 通信は暗号化されます（HTTPS）
+- アップロードされたファイルはサーバに保存せず、メモリ上で処理します
+- ファイルが大きすぎる場合は処理できません
         """.strip()
     )
 
@@ -321,13 +396,11 @@ def main() -> None:
         st.info("CSVを置くと自動でチェックを開始します。")
         return
 
-    # アップロード直後の再実行で 0byte を掴むことがあるので弾く
     raw = uploaded.getvalue()
     if not raw:
         st.info("アップロード処理中です。完了後に自動で検査します…")
         return
 
-    # 同一ファイル連打での“再計算”を防止（再実行に強くする）
     file_sig = (uploaded.name, len(raw), hashlib.sha256(raw).hexdigest())
     if st.session_state.get("last_file_sig") == file_sig:
         cached = st.session_state.get("last_result")
@@ -339,30 +412,25 @@ def main() -> None:
     try:
         show_processing_overlay(overlay_ph)
 
-        # cp932でデコード（失敗したら即エラー）
         try:
             text = raw.decode("cp932")
         except UnicodeDecodeError as e:
             raise ValueError("cp932としてデコードできませんでした。文字コードが違います。") from e
 
-        # 本処理
-        error_found, error_details, total_records, total_physical_lines = check_csv_from_text(text)
-        date_info = analyze_dates_from_text(text)
+        error_found, error_details, total_records, total_physical_lines, date_summary = check_and_analyze(text)
 
-        result_payload = dict(
+        st.session_state["last_result"] = dict(
             error_found=error_found,
             error_details=error_details,
             total_records=total_records,
-            total_physical_lines=total_physical_lines,
-            date_info=date_info,
+            total_physical_lines=total_physical_lines,  # 表示しない（内部用）
+            date_summary=date_summary,
             uploaded_name=uploaded.name,
         )
-        st.session_state["last_result"] = result_payload
 
     except Exception as e:
         hide_processing_overlay(overlay_ph)
         st.error("エラー：期待している形式のCSVとして処理できませんでした。")
-        # 原因追跡用（本番で邪魔なら str(e) に戻してOK）
         st.exception(e)
         return
     finally:
@@ -376,15 +444,14 @@ def render_result(
     error_found: bool,
     error_details: List[ErrorDetail],
     total_records: int,
-    total_physical_lines: int,
-    date_info: DateAnalysis,
+    total_physical_lines: int,  # 表示しない
+    date_summary: DateSummary,
     uploaded_name: str,
 ) -> None:
     st.subheader("判定結果")
+    st.caption(f"読み込みレコード数(ヘッダー除く): {total_records} 件")
 
-    st.caption(f"読み込みレコード数: {total_records} 件")
-    st.caption(f"読み込み物理行数: {total_physical_lines} 行（上限 {MAX_PHYSICAL_LINES:,} 行）")
-
+    # --- NGチェック結果 ---
     if not error_found:
         st.success("問題ありません（NG条件に該当する行は見つかりませんでした）")
     else:
@@ -402,12 +469,10 @@ def render_result(
         if len(error_details) > 10:
             st.caption(f"…他 {len(error_details) - 10} 件")
 
-        # エラー詳細CSVをダウンロード（ディスクに書かない）
         error_csv_bytes = build_error_csv_bytes(error_details)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_stem = uploaded_name.rsplit(".", 1)[0]
         out_name = f"{safe_stem}_error_{ts}.csv"
-
         st.download_button(
             label="エラー詳細CSVをダウンロード（UTF-8）",
             data=error_csv_bytes,
@@ -415,21 +480,60 @@ def render_result(
             mime="text/csv",
         )
 
-    # 日付チェック
-    st.subheader("日付チェック（yyyy/mm/dd hh:mi:ss だけ抽出）")
-    if date_info.total_matches == 0:
-        st.warning("対象形式の日付は見つかりませんでした。")
+    # --- 日付チェック結果 ---
+    st.subheader("日付チェック（9列目・17列目）")
+
+    ds = date_summary
+    st.caption(f"検出件数（箇所）: {ds.total_checked_cells} 件（9列目・17列目のうち日付として成立したもの）")
+    st.markdown(
+        f"""
+- 9列目（日付）OK: **{ds.count_col9_ok} 件**
+- 17列目（日付）OK: **{ds.count_col17_ok} 件**
+- 日付チェック: エラー **{ds.count_error} 件** / 警告 **{ds.count_warn} 件**
+        """.strip()
+    )
+
+    if ds.issues:
+        hard_errors = [x for x in ds.issues if x.severity == "ERROR"]
+        warns = [x for x in ds.issues if x.severity == "WARN"]
+
+        if hard_errors:
+            st.error("日付チェックでエラーがあります（9列目が不正）。業務上あり得ないデータです。")
+
+        if warns:
+            st.warning("日付チェックで警告があります。人間による確認が必要です。")
+
+        st.markdown("#### 日付チェックの指摘（最大20件）")
+        preview = ds.issues[:20]
+        st.table(
+            [
+                {
+                    "レコード番号": it.record_no,
+                    "開始物理行(参考)": it.start_physical_line,
+                    "重要度": it.severity,
+                    "種別": it.issue_type,
+                    "9列目": it.col9,
+                    "17列目": it.col17,
+                    "補足": it.note,
+                }
+                for it in preview
+            ]
+        )
+        if len(ds.issues) > 20:
+            st.caption(f"…他 {len(ds.issues) - 20} 件")
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_stem = uploaded_name.rsplit(".", 1)[0]
+        out_name = f"{safe_stem}_date_issues_{ts}.csv"
+        csv_bytes = build_date_issue_csv_bytes(ds.issues)
+        st.download_button(
+            label="日付チェック指摘一覧CSVをダウンロード（UTF-8）",
+            data=csv_bytes,
+            file_name=out_name,
+            mime="text/csv",
+        )
     else:
-        if len(date_info.unique_days) == 1 and date_info.first_day_str:
-            dt = datetime.strptime(date_info.first_day_str, "%Y/%m/%d")
-            st.success(f"ファイル内の日付は **{dt.strftime('%m')}月{dt.strftime('%d')}日** でした（すべて同じ日）")
-            st.caption(f"検出件数: {date_info.total_matches} 件")
-        else:
-            days_sorted = sorted(date_info.unique_days)
-            example = ", ".join(days_sorted[:5]) + (" ..." if len(days_sorted) > 5 else "")
-            st.error("ファイル内の日付は複数日です。")
-            st.caption(f"例: {example}")
-            st.caption(f"検出件数: {date_info.total_matches} 件 / {len(date_info.unique_days)} 日分")
+        st.success("日付チェック上の指摘はありません。")
 
     with st.expander("今日の豆知識（任意）"):
         st.text(friendly_today_info())
