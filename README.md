@@ -7,4 +7,4 @@ Files are processed in memory and never stored on the server.
 ## Security
 - Static analysis: Bandit (no issues found)
 - Dependency audit: pip-audit (no known vulnerabilities)
-- SBOM: CycloneDX (`sbom.cdx.json`)
+- SBOM: CycloneDX (`sbom.json`)
