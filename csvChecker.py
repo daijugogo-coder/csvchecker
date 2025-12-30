@@ -157,7 +157,7 @@ def build_date_issue_csv_bytes(issues: List[DateIssue]) -> bytes:
     w = csv.writer(buf, lineterminator="\n")
     w.writerow(["レコード番号", "開始物理行(参考)", "重要度", "種別", "9列目", "17列目", "補足"])
     for it in issues:
-        w.writerow([it.record_no, it.start_physical_line, it.severity, it.issue_type, it.col9, it.col17, it.note])
+        w.writerow([it.record_no, it.start_physical_line, it.severity, it.issue_type, it.col9, it.note])
     return buf.getvalue().encode("utf-8")
 
 
@@ -427,10 +427,10 @@ def render_result(
         )
 
     # --- 日付チェック結果 ---
-    st.subheader("日付チェック（9列目・17列目）")
+    st.subheader("日付チェック（9列目）")
 
     ds = date_summary
-    st.caption(f"検出件数（箇所）: {ds.total_checked_cells} 件（9列目・17列目のうち日付として成立したもの）")
+    st.caption(f"検出件数（箇所）: {ds.total_checked_cells} 件（9列目のうち日付として成立したもの）")
     st.markdown(
         f"""
 - 9列目（日付）OK: **{ds.count_col9_ok} 件**
@@ -458,7 +458,6 @@ def render_result(
                     "重要度": it.severity,
                     "種別": it.issue_type,
                     "9列目": it.col9,
-                    "17列目": it.col17,
                     "補足": it.note,
                 }
                 for it in preview
