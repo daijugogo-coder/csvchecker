@@ -89,8 +89,6 @@ class DateIssue:
 class DateSummary:
     total_checked_cells: int
     count_col9_ok: int
-    count_col17_ok: int
-    count_warn: int
     count_error: int
     issues: List[DateIssue]
 
@@ -173,8 +171,6 @@ def check_and_analyze(csv_text: str) -> Tuple[bool, List[ErrorDetail], int, int,
 
     total_checked_cells = 0
     count_col9_ok = 0
-    count_col17_ok = 0
-    count_warn = 0
     count_error = 0
     issues: List[DateIssue] = []
 
@@ -222,7 +218,6 @@ def check_and_analyze(csv_text: str) -> Tuple[bool, List[ErrorDetail], int, int,
         # 日付チェック（9列目必須、17列目は警告基準）
         # ----------------------------
         col9 = row[DATE_COL_9].strip() if len(row) > DATE_COL_9 else ""
-        col17 = row[DATE_COL_17].strip() if len(row) > DATE_COL_17 else ""
 
         dt9 = parse_dt_str(col9)
         if dt9 is None:
@@ -234,7 +229,6 @@ def check_and_analyze(csv_text: str) -> Tuple[bool, List[ErrorDetail], int, int,
                     severity="ERROR",
                     issue_type="COL9_MISSING_OR_INVALID",
                     col9=col9,
-                    col17=col17,
                     note="9列目に yyyy/mm/dd hh:mm:ss が必要です（業務上あり得ないデータ）。",
                 )
             )
@@ -242,58 +236,10 @@ def check_and_analyze(csv_text: str) -> Tuple[bool, List[ErrorDetail], int, int,
             count_col9_ok += 1
             total_checked_cells += 1
 
-        dt17 = parse_dt_str(col17)
-        if not col17.strip():
-            count_warn += 1
-            issues.append(
-                DateIssue(
-                    record_no=data_record_no,
-                    start_physical_line=start_physical_line,
-                    severity="WARN",
-                    issue_type="COL17_EMPTY",
-                    col9=col9,
-                    col17=col17,
-                    note="17列目が空です（要確認）。NULLの場合もあり得るため人間確認が必要です。",
-                )
-            )
-        elif dt17 is None:
-            count_warn += 1
-            issues.append(
-                DateIssue(
-                    record_no=data_record_no,
-                    start_physical_line=start_physical_line,
-                    severity="WARN",
-                    issue_type="COL17_INVALID",
-                    col9=col9,
-                    col17=col17,
-                    note="17列目が日付形式ではありません（要確認）。",
-                )
-            )
-        else:
-            count_col17_ok += 1
-            total_checked_cells += 1
-            if dt9 is not None:
-                d9 = dt9.strftime("%Y/%m/%d")
-                d17 = dt17.strftime("%Y/%m/%d")
-                if d9 != d17:
-                    count_warn += 1
-                    issues.append(
-                        DateIssue(
-                            record_no=data_record_no,
-                            start_physical_line=start_physical_line,
-                            severity="WARN",
-                            issue_type="DATE_MISMATCH",
-                            col9=col9,
-                            col17=col17,
-                            note=f"9列目({d9}) と 17列目({d17}) の日付が一致しません（要確認）。",
-                        )
-                    )
 
     date_summary = DateSummary(
         total_checked_cells=total_checked_cells,
         count_col9_ok=count_col9_ok,
-        count_col17_ok=count_col17_ok,
-        count_warn=count_warn,
         count_error=count_error,
         issues=issues,
     )
@@ -488,8 +434,7 @@ def render_result(
     st.markdown(
         f"""
 - 9列目（日付）OK: **{ds.count_col9_ok} 件**
-- 17列目（日付）OK: **{ds.count_col17_ok} 件**
-- 日付チェック: エラー **{ds.count_error} 件** / 警告 **{ds.count_warn} 件**
+- 日付チェック: エラー **{ds.count_error} 件**
         """.strip()
     )
 
